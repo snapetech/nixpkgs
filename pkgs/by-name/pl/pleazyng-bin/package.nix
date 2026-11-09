@@ -4,6 +4,15 @@
   fetchurl,
   buildFHSEnv,
   python3,
+  gdk-pixbuf,
+  libx11,
+  libxext,
+  libxrender,
+  libxcb,
+  fontconfig,
+  binutils,
+  gnutar,
+  zstd,
 }:
 let
   version = "3.0.7";
@@ -18,7 +27,7 @@ let
     };
   };
   source =
-    sources.${stdenvNoCC.hostPlatform.system}
+    sources.${stdenv.hostPlatform.system}
       or (throw "Pleazyng release bundles support x86_64-linux and aarch64-linux");
   bundle = stdenvNoCC.mkDerivation {
     pname = "pleazyng-bundle";
@@ -30,7 +39,10 @@ let
     # Preserve native engines, models and providers exactly as released.
     dontUnpack = true;
     dontFixup = true;
-    nativeBuildInputs = [ python3 ];
+    nativeBuildInputs = [
+      python3
+      gdk-pixbuf.dev
+    ];
     installPhase = ''
       runHook preInstall
       mkdir -p $out/lib/pleazyng
@@ -38,41 +50,100 @@ let
       test -x $out/lib/pleazyng/pleazyng
       test -f $out/lib/pleazyng/pleazyng.sh
       chmod +x $out/lib/pleazyng/pleazyng.sh
+      LD_LIBRARY_PATH=${
+        lib.makeLibraryPath [
+          libx11
+          libxext
+          libxrender
+          libxcb
+          fontconfig
+        ]
+      } \
+      python3 ${./rebuild-pixbuf-cache.py} $out/lib/pleazyng \
+        --query-tool ${gdk-pixbuf.dev}/bin/gdk-pixbuf-query-loaders
       python3 ${./relocate-caches.py} $out/lib/pleazyng
       runHook postInstall
     '';
   };
+  webkitSource = (builtins.fromJSON (builtins.readFile ./webkit-runtime.json)).${source.arch};
+  webkitHelpers = stdenvNoCC.mkDerivation {
+    pname = "pleazyng-webkit-helpers";
+    version = webkitSource.version;
+    src = fetchurl { inherit (webkitSource) url sha256; };
+    dontUnpack = true;
+    dontFixup = true;
+    nativeBuildInputs = [
+      python3
+      binutils
+      gnutar
+      zstd
+    ];
+    installPhase = ''
+      python3 ${./install-webkit-helpers.py} --bundle ${bundle}/lib/pleazyng --deb $src \
+        --arch ${source.arch} --root $out --metadata ${./webkit-runtime.json}
+      # FHS merges package /lib into /usr/lib, including the exact Ubuntu
+      # multiarch path compiled into this production WebKit library.
+      mv $out/usr/lib $out/lib
+      mv $out/usr/share $out/share
+      rmdir $out/usr
+    '';
+  };
 in
 buildFHSEnv {
-  name = "pleazyng";
+  pname = "pleazyng";
+  inherit version;
+  passthru = { inherit bundle webkitHelpers; };
   # The FHS environment keeps the published bundle and launcher together.
   # It is a compatibility environment, not a security sandbox.
   targetPkgs =
-    p: with p; [
-      bash
-      coreutils
-      gtk3
-      webkitgtk_4_1
-      libsecret
-      libepoxy
-      alsa-lib
-      libevdev
-      glib
-      wayland
-      libglvnd
-      libva
-      libvdpau
-      vulkan-loader
-      libdrm
-      mesa
-      libx11
-      libxcb
-      libxext
-      libgbm
-      fontconfig
-      xdg-utils
-      cacert
-    ];
+    p:
+    let
+      runtime = with p; [
+        bash
+        coreutils
+        gtk3
+        libsecret
+        libepoxy
+        alsa-lib
+        libevdev
+        glib
+        wayland
+        libglvnd
+        libva
+        libvdpau
+        vulkan-loader
+        libdrm
+        mesa
+        libx11
+        libxcb
+        libxext
+        libgbm
+        fontconfig
+        dejavu_fonts
+        shared-mime-info
+        xdg-utils
+        cacert
+        xdg-dbus-proxy
+        webkitHelpers
+      ];
+      closure = p.closureInfo {
+        rootPaths = runtime ++ [
+          bundle
+          p.bubblewrap
+        ];
+      };
+      sandboxBubblewrap = p.writeShellScriptBin "bwrap" ''
+        # The Ubuntu WebKit sandbox does not know about Nix store symlinks.
+        # Expose only its immutable runtime closure, read-only, while retaining
+        # WebKit's namespace, seccomp and broker restrictions.
+        args=(--dir /nix --dir /nix/store)
+        while IFS= read -r path; do
+          args+=(--ro-bind "$path" "$path")
+        done < ${closure}/store-paths
+        exec ${p.bubblewrap}/bin/bwrap "''${args[@]}" "$@"
+      '';
+    in
+    runtime ++ [ sandboxBubblewrap ];
   runScript = "${bundle}/lib/pleazyng/pleazyng.sh";
   extraInstallCommands = ''
     install -Dm644 ${./org.snapetech.pleazyng.desktop} \
