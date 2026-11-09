@@ -27,7 +27,7 @@ let
     };
   };
   source =
-    sources.${stdenv.hostPlatform.system}
+    sources.${stdenvNoCC.hostPlatform.system}
       or (throw "Pleazyng release bundles support x86_64-linux and aarch64-linux");
   bundle = stdenvNoCC.mkDerivation {
     pname = "pleazyng-bundle";
